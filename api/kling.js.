@@ -1,0 +1,226 @@
+// RMARC VIDEO AI — Puente seguro con la API oficial de Kling AI (KlingAI Open Platform)
+// Documentación oficial: https://kling.ai/document-api
+//   Dominio:  https://api-singapore.klingai.com
+//   Auth (ÚNICO esquema): API Key sencilla → Authorization: Bearer <KLING_API_KEY>
+//     (la clave se crea en la consola de Kling: «Create a new API Key»; se muestra
+//      una sola vez y se configura en Vercel como variable de entorno)
+//   Endpoints oficiales compatibles con API Key (sistema nuevo):
+//     POST /text-to-video/kling-3.0   → crea tarea texto→video (duración 3–15 s)
+//     POST /image-to-video/kling-3.0  → anima una imagen (first_frame, URL o base64)
+//     GET  /tasks?task_ids=<id>       → consulta estado y URLs del resultado
+//   Nota: los endpoints legacy /v1/videos/... exigen el par Access/Secret Key (JWT);
+//   este backend NO los usa: trabaja exclusivamente con la API Key y el sistema nuevo.
+// IMPORTANTE: este archivo corre SOLO en el servidor (función Vercel /api/kling).
+// La clave nunca se envía al navegador ni se expone en las respuestas.
+
+const KLING_DOMAIN = 'https://api-singapore.klingai.com';
+
+// ---------- Credenciales (solo servidor, esquema único API Key) ----------
+function getCreds() {
+  const apiKey = (process.env.KLING_API_KEY || '').trim();
+  return { apiKey };
+}
+
+// Único esquema: la API Key se envía tal cual como Bearer. Sin JWT ni pares AK/SK.
+function buildToken(creds) {
+  return creds.apiKey || null;
+}
+
+// Diagnóstico sin exponer valores: solo presencia y longitud
+function credsReport(creds) {
+  return {
+    KLING_API_KEY: { configurada: Boolean(creds.apiKey), longitud: creds.apiKey ? creds.apiKey.length : 0 },
+    esquemaUsado: creds.apiKey ? 'API_KEY (Bearer directo)' : 'NINGUNO',
+  };
+}
+
+// ---------- Mensajes y pistas de error (en español, accionables) ----------
+function hintFor(code, message = '') {
+  const msg = String(message || '').toLowerCase();
+  if (code === 401 || code === 1002 || code === 1000 ||
+    msg.includes('invalid api key') || msg.includes('api key') && (msg.includes('invalid') || msg.includes('not found') || msg.includes('expired')) ||
+    msg.includes('unauthorized') || msg.includes('authentication'))
+    return 'Kling rechazó la API Key. Verifica en Vercel → Settings → Environment Variables que KLING_API_KEY sea la clave completa creada en la consola de Kling (comienza con «api-key-kling»), sin espacios ni comillas, activa para el entorno Production. Después redespliega el proyecto.';
+  if (code === 1004 || msg.includes('expired'))
+    return 'La credencial o la tarea expiró. Si es la clave, crea una nueva en la consola de Kling; si es una tarea, vuelve a generarla.';
+  if (code === 1101 || msg.includes('arrears') || msg.includes('balance'))
+    return 'Tu cuenta Kling no tiene saldo suficiente (1101). Recarga saldo o activa el pago por uso en https://kling.ai/dev/pricing';
+  if (code === 1102 || msg.includes('resource pack') || msg.includes('resource'))
+    return 'Tu paquete de recursos Kling está agotado o expiró (1102). Compra un paquete de generación de video en https://kling.ai/dev/pricing';
+  if (msg.includes('model') && (msg.includes('not') || msg.includes('permission') || msg.includes('access')))
+    return 'Tu cuenta Kling no tiene acceso a ese modelo o tu plan no lo incluye. Con API Key la generación usa Kling 3.0; revisa tu plan en https://kling.ai/dev/pricing';
+  if (msg.includes('task not found') || msg.includes('not found'))
+    return 'Kling no encontró esa tarea; puede haber expirado en su servidor.';
+  return '';
+}
+
+function sanitizeKlingError(r, fallbackMsg) {
+  const j = r.json || {};
+  const code = typeof j.code === 'number' ? j.code : (r.status || 0);
+  const message = j.message || fallbackMsg || `Error HTTP ${r.status} al llamar a Kling`;
+  return { error: 'kling_error', codigoKling: code, mensaje: message, pista: hintFor(code, message) };
+}
+
+// ---------- Llamada HTTP a Kling ----------
+async function klingFetch(path, { method = 'GET', body, token } = {}) {
+  let res;
+  try {
+    res = await fetch(KLING_DOMAIN + path, {
+      method,
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  } catch (e) {
+    return { status: 0, json: null, text: '', networkError: String(e && e.message ? e.message : e) };
+  }
+  const text = await res.text();
+  let json = null;
+  try { json = JSON.parse(text); } catch { /* respuesta no JSON */ }
+  return { status: res.status, json, text };
+}
+
+// ---------- Handler principal (Vercel Serverless) ----------
+export default async function handler(req, res) {
+  // CORS básico por si se prueba desde otro origen en desarrollo
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  if (req.method === 'OPTIONS') return res.status(200).end();
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'metodo_invalido', mensaje: 'Usa POST con JSON { action: "verify" | "create" | "status" }.' });
+  }
+
+  const body = (typeof req.body === 'string' ? JSON.parse(req.body || '{}') : req.body) || {};
+  const action = body.action || 'verify';
+  const creds = getCreds();
+  const token = buildToken(creds);
+
+  try {
+    // ============ ACCIÓN verify: revisa variables y prueba la autenticación ============
+    if (action === 'verify') {
+      const info = { variables: credsReport(creds), dominioKling: KLING_DOMAIN };
+      if (!token) {
+        return res.status(200).json({
+          ok: false, ...info,
+          diagnostico: 'Falta la API Key de Kling en Vercel.',
+          pasos: [
+            'Ve a tu proyecto en Vercel → Settings → Environment Variables.',
+            'Agrega KLING_API_KEY con la clave que te da la consola de Kling (comienza con «api-key-kling»).',
+            'Marca el entorno Production (y Preview si pruebas ahí).',
+            'Redespliega el proyecto (Deployments → Redeploy) para que la variable surta efecto.',
+          ],
+        });
+      }
+      // Prueba barata: consultar una tarea inexistente valida la autenticación sin consumir recursos.
+      const probe = await klingFetch('/tasks?task_ids=0000000000000000', { token });
+      if (probe.networkError) {
+        return res.status(200).json({ ok: false, ...info, diagnostico: 'La función no pudo conectarse con api-singapore.klingai.com (red/DNS del servidor).', detalle: probe.networkError });
+      }
+      const code = probe.json && typeof probe.json.code === 'number' ? probe.json.code : null;
+      const mensajeKling = String((probe.json && probe.json.message) || '');
+      const esRechazoAuth = probe.status === 401 || code === 1000 || code === 1002 || code === 1004 ||
+        /invalid api key|unauthorized|authentication|access key|api key.*(invalid|not found|expired)/i.test(mensajeKling);
+      if (esRechazoAuth) {
+        return res.status(200).json({ ok: false, ...info, diagnostico: 'Kling rechazó la API Key (autenticación fallida).', detalle: probe.json || (probe.text || '').slice(0, 300), pista: hintFor(code || probe.status, mensajeKling) });
+      }
+      return res.status(200).json({
+        ok: true, ...info,
+        diagnostico: 'Credenciales aceptadas por Kling. La conexión con la API oficial funciona; la respuesta de prueba fue "tarea no encontrada", lo cual confirma que la autenticación pasó.',
+        detalle: probe.json || undefined,
+      });
+    }
+
+    // ============ ACCIÓN create: crea la tarea de video ============
+    if (action === 'create') {
+      if (!token) {
+        return res.status(500).json({
+          error: 'faltan_credenciales',
+          mensaje: 'El servidor no encontró KLING_API_KEY. Configúrala en Vercel → Settings → Environment Variables y redespliega. Nunca va en el código del navegador.',
+        });
+      }
+      const mode = body.mode === 'text' ? 'text' : 'image'; // image = anima la fotografía; text = solo guion
+      const model = String(body.model || 'kling-v1-6'); // el selector de la app; la generación real usa Kling 3.0
+      const aspect = ['16:9', '9:16', '1:1'].includes(body.aspect) ? body.aspect : '9:16';
+      const quality = body.quality === 'pro' ? 'pro' : 'std';
+      const prompt = String(body.prompt || '').slice(0, 3000).trim(); // API oficial: máximo 3072 caracteres
+      const imageB64 = String(body.image || '').replace(/^data:image\/[a-zA-Z+]+;base64,/, '');
+
+      if (!prompt) return res.status(400).json({ error: 'falta_prompt', mensaje: 'Escribe el guion o texto para el video.' });
+      if (mode === 'image' && !imageB64) return res.status(400).json({ error: 'falta_imagen', mensaje: 'No se recibió la fotografía para animar.' });
+
+      // Duración entera 3–15 s (API oficial de Kling 3.0); 5/10/15 de la app son válidos
+      const duracion = Math.round(Number(body.duration) || 5);
+      if (!Number.isFinite(duracion) || duracion < 3 || duracion > 15) {
+        return res.status(400).json({
+          error: 'duracion_invalida',
+          mensaje: 'La duración debe estar entre 3 y 15 segundos según la API oficial de Kling 3.0 (la app usa 5, 10 o 15).',
+        });
+      }
+
+      // Resolución: la calidad de la app se aplica como 720p (estándar) u 1080p (profesional)
+      const resolution = (quality === 'pro' || model === 'kling-v2-1-master') ? '1080p' : '720p';
+
+      const isImage = mode === 'image';
+      const path = isImage ? '/image-to-video/kling-3.0' : '/text-to-video/kling-3.0';
+      const settings = { resolution, duration: duracion, audio: 'off' };
+      const options = { external_task_id: `rmarc-${Date.now()}`, watermark_info: { enabled: false } };
+      let payload;
+      if (isImage) {
+        // Imagen a video: la fotografía viaja como first_frame (URL o base64); el formato sigue la imagen
+        payload = {
+          contents: [
+            { type: 'prompt', text: prompt },
+            { type: 'first_frame', url: imageB64 },
+          ],
+          settings: { ...settings, multi_shot: false },
+          options,
+        };
+      } else {
+        payload = {
+          prompt,
+          settings: { ...settings, multi_shot: true, aspect_ratio: aspect },
+          options,
+        };
+      }
+
+      const r = await klingFetch(path, { method: 'POST', body: payload, token });
+      if (r.networkError) return res.status(502).json({ error: 'red', mensaje: 'No se pudo conectar con api-singapore.klingai.com.', detalle: r.networkError });
+      if (!r.json || (typeof r.json.code === 'number' && r.json.code !== 0) || r.status >= 400) {
+        return res.status(502).json(sanitizeKlingError(r, 'Kling no aceptó la tarea de video'));
+      }
+      const taskId = (r.json && r.json.data && (r.json.data.id || r.json.data.task_id)) || null;
+      if (!taskId) return res.status(502).json({ error: 'kling_error', mensaje: 'Kling respondió sin identificador de tarea.', detalle: (r.text || '').slice(0, 300) });
+      return res.status(200).json({ ok: true, taskId, modeloEfectivo: 'kling-3.0', mode, model, duration: String(duracion), createdAt: Date.now() });
+    }
+
+    // ============ ACCIÓN status: consulta el progreso de la tarea ============
+    if (action === 'status') {
+      if (!token) return res.status(500).json({ error: 'faltan_credenciales', mensaje: 'Falta KLING_API_KEY en el servidor de Vercel.' });
+      const taskId = String(body.taskId || '').trim();
+      if (!taskId) return res.status(400).json({ error: 'falta_taskid', mensaje: 'Falta el identificador de la tarea.' });
+      const r = await klingFetch(`/tasks?task_ids=${encodeURIComponent(taskId)}`, { token });
+      if (r.networkError) return res.status(502).json({ error: 'red', mensaje: 'Sin conexión con Kling al consultar el progreso.', detalle: r.networkError });
+      if (!r.json || (typeof r.json.code === 'number' && r.json.code !== 0) || r.status >= 400) {
+        return res.status(502).json(sanitizeKlingError(r, 'Kling rechazó la consulta de estado'));
+      }
+      const lista = Array.isArray(r.json && r.json.data) ? r.json.data : (r.json && r.json.data ? [r.json.data] : []);
+      const task = lista.find(t => String(t.id) === String(taskId)) || lista[0] || {};
+      const raw = String(task.status || task.task_status || '').toLowerCase();
+      const estado = { submitted: 'en_cola', processing: 'procesando', succeed: 'listo', succeeded: 'listo', failed: 'fallido' }[raw] || 'procesando';
+      const outputs = Array.isArray(task.outputs) ? task.outputs : [];
+      const videos = outputs
+        .filter(o => o && (o.type === 'video' || o.url))
+        .map(o => ({ url: o.url, duracion: o.duration }));
+      return res.status(200).json({
+        ok: true, estado,
+        mensajeKling: task.message || task.task_status_msg || '',
+        progreso: estado === 'en_cola' ? 'Tarea aceptada, esperando turno en Kling' : estado === 'procesando' ? 'Kling está generando tu video' : undefined,
+        videos,
+      });
+    }
+
+    return res.status(400).json({ error: 'accion_invalida', mensaje: `Acción desconocida: ${action}` });
+  } catch (e) {
+    return res.status(500).json({ error: 'interno', mensaje: 'Error interno del puente Kling.', detalle: String(e && e.message ? e.message : e) });
+  }
+}
